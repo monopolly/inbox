@@ -3,76 +3,89 @@ package inbox
 import (
 	"crypto/tls"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
-	"net/mail"
-	"strings"
+	"sync"
+	"sync/atomic"
 )
 
-func New(p *Options) (a *Engine) {
+// Engine is an inbound SMTP server: it accepts mail for Options.Domains
+// and passes every message to Options.Handler.
+type Engine struct {
+	opt      Options
+	hostname string
+	maxSize  int // bytes
+	tls      *tls.Config
+	log      *slog.Logger
 
-	p.valid()
+	paused  atomic.Bool
+	closing atomic.Bool
 
-	a = new(Engine)
+	total, rejected, messages, acceptErrors atomic.Int64
 
-	// smtp
-	a.smtp = &server{}
-	a.smtp.MaxSize = p.MaxSizeMB
-	a.smtp.Addr = fmt.Sprintf(":%d", p.Port)
-	a.smtp.Appname = p.App
-	a.smtp.Handler = p.Handler
-	a.smtp.Hostname = p.Domains[0]
-	a.smtp.Timeout = p.Timeout
+	mu        sync.Mutex
+	listeners map[net.Listener]struct{}
+	sessions  map[*session]struct{}
+	perIP     map[string]int
+	wg        sync.WaitGroup
+}
 
-	switch p.TLS != nil {
-	case true:
-		a.smtp.TLSConfig = p.TLS
-	default:
-		a.smtp.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{certs(p.App, p.Domains...)},
-			ServerName:   p.Domains[0],
+// Stats is a snapshot of the server counters.
+type Stats struct {
+	Total    int64 // connections accepted since start
+	Active   int   // connections being served now
+	Rejected int64 // connections refused because of pause, limits or shutdown
+	Messages int64 // messages accepted by Handler
+	Errors   int64 // listener accept errors
+}
+
+func New(p *Options) (*Engine, error) {
+
+	o := *p
+	if err := o.valid(); err != nil {
+		return nil, err
+	}
+
+	a := &Engine{
+		opt:       o,
+		hostname:  o.Domains[0],
+		maxSize:   o.MaxSizeMB << 20,
+		tls:       o.TLS,
+		log:       o.Logger,
+		listeners: make(map[net.Listener]struct{}),
+		sessions:  make(map[*session]struct{}),
+		perIP:     make(map[string]int),
+	}
+
+	if a.tls == nil {
+		cert, err := selfSigned(o.App, o.Domains...)
+		if err != nil {
+			return nil, fmt.Errorf("inbox: self-signed certificate: %w", err)
+		}
+		a.tls = &tls.Config{
+			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
 	}
 
-	a.smtp.Log = func(s string, arg ...any) { p.Log("SMTP: "+s, arg...) }
-	a.smtp.Error = func(s string, arg ...any) { p.Error("SMTP: "+s, arg...) }
-	a.smtp.HandlerRcpt = a.checker(p)
-	return
+	return a, nil
 }
 
-type Engine struct {
-	smtp *server
-}
-
-// проверяет адрес name @ domain, только после
-func (a *Engine) checker(p *Options) HandlerRcpt {
-	return func(remoteAddr net.Addr, from string, to string) bool {
-		ad, err := mail.ParseAddress(to)
-		if err != nil {
-			return false
-		}
-		i := strings.Index(ad.Address, "@")
-		if i == -1 {
-			return false
-		}
-		return p.Checker(ad.Address[:i], ad.Address[i+1:], remoteAddr)
-	}
-}
-
-func (a *Engine) Settings() *server {
-	return a.smtp
-}
-
-func (a *Engine) ListenAndServe() {
-
-	a.smtp.Log("Start %s", a.smtp.Addr)
-	err := a.smtp.ListenAndServe()
-	if err != nil {
-		log.Panic(err)
-	}
-}
-
+// Pause makes the server refuse new connections with 421 while v is true.
+// Sessions already in progress are not affected.
 func (a *Engine) Pause(v bool) {
-	a.smtp.pause = v
+	a.paused.Store(v)
+}
+
+func (a *Engine) Stats() Stats {
+	a.mu.Lock()
+	active := len(a.sessions)
+	a.mu.Unlock()
+	return Stats{
+		Total:    a.total.Load(),
+		Active:   active,
+		Rejected: a.rejected.Load(),
+		Messages: a.messages.Load(),
+		Errors:   a.acceptErrors.Load(),
+	}
 }

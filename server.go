@@ -1,153 +1,145 @@
 package inbox
 
 import (
-	"bufio"
-	"crypto/tls"
-
-	//"io/ioutil"
-
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"time"
 )
 
-// Server is an SMTP server.
-type server struct {
-	Addr         string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Appname      string
-	AuthHandler  AuthHandler
-	AuthMechs    map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
-	AuthRequired bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
-	Handler      Handler
-	HandlerRcpt  HandlerRcpt
-	Hostname     string
-	LogRead      LogFunc
-	LogWrite     LogFunc
-	Log          func(string, ...any)
-	Error        func(string, ...any)
-	MaxSize      int // Maximum message size allowed, in bytes
-	Timeout      time.Duration
-	TLSConfig    *tls.Config
-	TLSListener  bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
-	TLSRequired  bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
-	Volume       string
-
-	pause bool
-
-	count struct {
-		conn   int
-		errors int
-	}
-}
-
-// ConfigureTLS creates a TLS configuration from certificate and key files.
-// func (a *server) ConfigureTLS(certFile string, keyFile string) error {
-// 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	a.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-// 	return nil
-// }
-
-// ConfigureTLSWithPassphrase creates a TLS configuration from a certificate,
-// an encrypted key file and the associated passphrase:
-// func (a *server) ConfigureTLSWithPassphrase(
-// 	certFile string,
-// 	keyFile string,
-// 	passphrase string,
-// ) error {
-
-// 	certPEMBlock, err := os.ReadFile(certFile)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	keyPEMBlock, err := os.ReadFile(keyFile)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	keyDERBlock, _ := pem.Decode(keyPEMBlock)
-
-// 	keyPEMDecrypted, err := x509.DecryptPEMBlock(keyDERBlock, []byte(passphrase))
-// 	if err != nil {
-// 		return err
-// 	}
-// 	var pemBlock pem.Block
-// 	pemBlock.Type = keyDERBlock.Type
-// 	pemBlock.Bytes = keyPEMDecrypted
-// 	keyPEMBlock = pem.EncodeToMemory(&pemBlock)
-// 	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	a.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-// 	return nil
-// }
-
-// ListenAndServe listens on the TCP network address a.Addr and then
-// calls Serve to handle requests on incoming connections.  If
-// a.Addr is blank, ":25" is used.
-func (a *server) ListenAndServe() error {
-
-	var ln net.Listener
-	var err error
-
-	// If TLSListener is enabled, listen for TLS connections only.
-	if a.TLSConfig != nil && a.TLSListener {
-		ln, err = tls.Listen("tcp", a.Addr, a.TLSConfig)
-	} else {
-		ln, err = net.Listen("tcp", a.Addr)
-	}
+// ListenAndServe listens on Options.Port and serves connections until Shutdown.
+func (a *Engine) ListenAndServe() error {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", a.opt.Port))
 	if err != nil {
 		return err
 	}
+	a.log.Info("start", "addr", ln.Addr().String())
 	return a.Serve(ln)
 }
 
-// Serve creates a new SMTP session after a network connection is established.
-func (a *server) Serve(ln net.Listener) error {
+// Serve accepts connections on ln. It returns ErrServerClosed after Shutdown,
+// or the error when ln is closed by someone else.
+func (a *Engine) Serve(ln net.Listener) error {
+	if !a.addListener(ln) {
+		ln.Close()
+		return ErrServerClosed
+	}
+	defer a.removeListener(ln)
 	defer ln.Close()
+
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			a.Error("%s IP: %s", err.Error(), ln.Addr().String())
-			a.count.errors++
+			if a.closing.Load() {
+				return ErrServerClosed
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			// temporary failure like EMFILE: back off instead of spinning
+			a.acceptErrors.Add(1)
+			delay = min(max(2*delay, 5*time.Millisecond), time.Second)
+			a.log.Error("accept", "err", err, "retry", delay)
+			time.Sleep(delay)
 			continue
 		}
-		if a.pause {
-			// Немедленно закрываем соединение с SMTP error
-			conn.Write([]byte("421 Service temporarily unavailable\r\n"))
-			conn.Close()
-			continue
-		}
-
-		session := a.newSession(conn)
-		session.volume = a.Volume
-		session.log = a.Log
-		session.errors = a.Error
-		a.count.conn++
-		go session.serve()
+		delay = 0
+		go a.handle(conn)
 	}
 }
 
-// Create new session from connection.
-func (a *server) newSession(conn net.Conn) (s *session) {
-	s = &session{
-		srv:  a,
-		conn: conn,
-		br:   bufio.NewReader(conn),
-		bw:   bufio.NewWriter(conn),
+// Shutdown stops accepting connections, closes idle sessions with 421 and
+// waits for messages in progress. If ctx ends first, the remaining
+// connections are closed and ctx.Err() is returned.
+func (a *Engine) Shutdown(ctx context.Context) error {
+	a.mu.Lock()
+	a.closing.Store(true)
+	for ln := range a.listeners {
+		ln.Close()
 	}
-
-	// Get remote end info for the Received header.
-	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
-	names, err := net.LookupAddr(s.remoteIP)
-	if err == nil && len(names) > 0 {
-		s.remoteHost = names[0]
-	} else {
-		s.remoteHost = "unknown"
+	for s := range a.sessions {
+		s.interrupt()
 	}
+	a.mu.Unlock()
 
-	// Set tls = true if TLS is already in use.
-	_, s.tls = s.conn.(*tls.Conn)
-	return
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		a.mu.Lock()
+		for s := range a.sessions {
+			s.raw.Close()
+		}
+		a.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (a *Engine) handle(conn net.Conn) {
+	s := a.newSession(conn, a.total.Add(1))
+	if reason := a.register(s); reason != "" {
+		a.rejected.Add(1)
+		s.log.Debug("refused", "reason", reason)
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "421 4.3.2 %s %s\r\n", a.hostname, reason)
+		conn.Close()
+		return
+	}
+	defer a.unregister(s)
+	s.serve()
+}
+
+// register admits a session or returns why it is refused.
+func (a *Engine) register(s *session) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch {
+	case a.closing.Load():
+		return "Service shutting down"
+	case a.paused.Load():
+		return "Service temporarily unavailable"
+	case a.opt.MaxConns > 0 && len(a.sessions) >= a.opt.MaxConns:
+		return "Too many connections"
+	case a.opt.MaxConnsPerIP > 0 && a.perIP[s.remoteIP] >= a.opt.MaxConnsPerIP:
+		return "Too many connections from your address"
+	}
+	a.sessions[s] = struct{}{}
+	a.perIP[s.remoteIP]++
+	a.wg.Add(1)
+	return ""
+}
+
+func (a *Engine) unregister(s *session) {
+	a.mu.Lock()
+	delete(a.sessions, s)
+	a.perIP[s.remoteIP]--
+	if a.perIP[s.remoteIP] <= 0 {
+		delete(a.perIP, s.remoteIP)
+	}
+	a.mu.Unlock()
+	a.wg.Done()
+}
+
+func (a *Engine) addListener(ln net.Listener) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closing.Load() {
+		return false
+	}
+	a.listeners[ln] = struct{}{}
+	return true
+}
+
+func (a *Engine) removeListener(ln net.Listener) {
+	a.mu.Lock()
+	delete(a.listeners, ln)
+	a.mu.Unlock()
 }

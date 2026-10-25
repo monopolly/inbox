@@ -2,34 +2,41 @@ package inbox
 
 import (
 	"crypto/tls"
-	"log"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"time"
 )
 
 type Options struct {
-	Dev       bool
-	App       string   //must
-	Domains   []string //must
-	Handler   Handler  //must
-	Checker   func(name, domain string, ip net.Addr) bool
-	MaxSizeMB int
+	App     string   // name in the banner and Received header, default "smtpd"
+	Domains []string // the first one is the server hostname, default os.Hostname()
+	Handler Handler  // must
 
-	Port int //25
+	// Checker decides whether mail for name@domain is accepted, nil accepts everything.
+	Checker func(name, domain string, ip net.Addr) bool
 
-	Timeout time.Duration
+	Port      int // 25
+	MaxSizeMB int // 30
 
-	Log   func(string, ...any)
-	Error func(string, ...any)
+	Timeout        time.Duration // per command and per data chunk, 5m
+	SessionTimeout time.Duration // whole connection, 30m, negative disables
 
-	TLS *tls.Config
+	MaxConns      int // simultaneous connections, 0 is unlimited
+	MaxConnsPerIP int // simultaneous connections from one IP, 0 is unlimited
+
+	TLS *tls.Config // STARTTLS, default is a self-signed certificate for Domains
+
+	// Logger gets server events; protocol lines are logged at debug level.
+	Logger *slog.Logger // slog.Default()
 }
 
-func (a *Options) valid() {
+func (a *Options) valid() error {
 
 	if a.Handler == nil {
-		panic("Handler must be")
+		return errors.New("inbox: Handler must be")
 	}
 
 	if a.Port == 0 {
@@ -41,22 +48,19 @@ func (a *Options) valid() {
 	}
 
 	if len(a.Domains) == 0 {
-		p, _ := os.Hostname()
+		p, err := os.Hostname()
+		if err != nil {
+			return fmt.Errorf("inbox: no Domains and no hostname: %w", err)
+		}
 		a.Domains = []string{p}
 	}
 
-	if a.Log == nil {
-		a.Log = log.Printf
+	if a.Logger == nil {
+		a.Logger = slog.Default()
 	}
 
-	if a.Error == nil {
-		a.Error = func(s string, a ...any) {
-			log.Printf("ERROR: "+s, a...)
-		}
-	}
-
-	if a.MaxSizeMB == 0 {
-		a.MaxSizeMB = 30 * 1024 * 1024
+	if a.MaxSizeMB <= 0 {
+		a.MaxSizeMB = 30
 	}
 
 	if a.Checker == nil {
@@ -65,8 +69,13 @@ func (a *Options) valid() {
 		}
 	}
 
-	if a.Timeout == 0 {
+	if a.Timeout <= 0 {
 		a.Timeout = time.Minute * 5
 	}
 
+	if a.SessionTimeout == 0 {
+		a.SessionTimeout = time.Minute * 30
+	}
+
+	return nil
 }
