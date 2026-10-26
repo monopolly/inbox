@@ -1,4 +1,4 @@
-package inbox
+package server
 
 import (
 	"bytes"
@@ -14,19 +14,21 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/monopolly/inbox/envelope"
 )
 
 type testServer struct {
 	*Engine
 	addr string
-	mail chan *Envelope
+	mail chan *envelope.Envelope
 }
 
 func start(t *testing.T, o Options) *testServer {
 	t.Helper()
-	ts := &testServer{mail: make(chan *Envelope, 10)}
+	ts := &testServer{mail: make(chan *envelope.Envelope, 10)}
 	if o.Handler == nil {
-		o.Handler = func(e *Envelope) error {
+		o.Handler = func(e *envelope.Envelope) error {
 			ts.mail <- e
 			return nil
 		}
@@ -55,7 +57,7 @@ func start(t *testing.T, o Options) *testServer {
 	return ts
 }
 
-func (ts *testServer) next(t *testing.T) *Envelope {
+func (ts *testServer) next(t *testing.T) *envelope.Envelope {
 	t.Helper()
 	select {
 	case e := <-ts.mail:
@@ -313,7 +315,7 @@ func TestSmuggling(t *testing.T) {
 func TestHandlerErrors(t *testing.T) {
 	var mode atomic.Int32
 	ts := start(t, Options{
-		Handler: func(e *Envelope) error {
+		Handler: func(e *envelope.Envelope) error {
 			switch mode.Load() {
 			case 0:
 				return errors.New("disk full")
@@ -511,7 +513,7 @@ func TestShutdownForce(t *testing.T) {
 }
 
 func TestServeClosedListener(t *testing.T) {
-	e, err := New(&Options{Handler: func(*Envelope) error { return nil }, Domains: []string{"mx"}})
+	e, err := New(&Options{Handler: func(*envelope.Envelope) error { return nil }, Domains: []string{"mx"}})
 	if err != nil {
 		t.Fatal(err)
 	}

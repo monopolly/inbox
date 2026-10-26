@@ -1,4 +1,4 @@
-package inbox
+package certs
 
 import (
 	"crypto/rand"
@@ -15,18 +15,18 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// TLSAutocert returns a STARTTLS config with Let's Encrypt certificates for
+// Autocert returns a STARTTLS config with Let's Encrypt certificates for
 // domains, cached in cacheDir. ACME can't validate over SMTP, so the returned
 // handler must serve the HTTP-01 challenge on port 80 of this host:
 //
-//	cfg, h := inbox.TLSAutocert("/var/lib/inbox/certs", "admin@example.com", "mx.example.com")
+//	cfg, h := certs.Autocert("/var/lib/inbox/certs", "admin@example.com", "mx.example.com")
 //	go http.ListenAndServe(":80", h)
 //
 // Sending MTAs often omit SNI or use another name, such handshakes get
 // the certificate of the first domain.
-func TLSAutocert(cacheDir, email string, domains ...string) (*tls.Config, http.Handler) {
+func Autocert(cacheDir, email string, domains ...string) (*tls.Config, http.Handler) {
 	if len(domains) == 0 {
-		panic("inbox: TLSAutocert needs at least one domain")
+		panic("certs: Autocert needs at least one domain")
 	}
 
 	manager := &autocert.Manager{
@@ -53,9 +53,9 @@ func TLSAutocert(cacheDir, email string, domains ...string) (*tls.Config, http.H
 	return cfg, manager.HTTPHandler(nil)
 }
 
-// selfSigned creates a self-signed certificate for hosts. Sending MTAs rarely
+// SelfSigned creates a self-signed certificate for hosts. Sending MTAs rarely
 // verify certificates, so it is enough for opportunistic STARTTLS.
-func selfSigned(company string, hosts ...string) (tls.Certificate, error) {
+func SelfSigned(company string, hosts ...string) (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return tls.Certificate{}, err

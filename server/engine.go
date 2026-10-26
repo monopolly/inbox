@@ -1,4 +1,4 @@
-package inbox
+package server
 
 import (
 	"crypto/tls"
@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"github.com/monopolly/inbox/certs"
 )
 
 // Engine is an inbound SMTP server: it accepts mail for Options.Domains
@@ -58,7 +60,7 @@ func New(p *Options) (*Engine, error) {
 	}
 
 	if a.tls == nil {
-		cert, err := selfSigned(o.App, o.Domains...)
+		cert, err := certs.SelfSigned(o.App, o.Domains...)
 		if err != nil {
 			return nil, fmt.Errorf("inbox: self-signed certificate: %w", err)
 		}

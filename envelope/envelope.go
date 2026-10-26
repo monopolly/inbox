@@ -1,4 +1,4 @@
-package inbox
+package envelope
 
 import (
 	"bytes"
@@ -16,7 +16,6 @@ import (
 
 	"blitiri.com.ar/go/spf"
 	"github.com/emersion/go-msgauth/dkim"
-	"github.com/monopolly/email"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
@@ -30,39 +29,48 @@ var resolver spf.DNSResolver = net.DefaultResolver
 // addressParser decodes =?charset?...?= display names in any charset.
 var addressParser = mail.AddressParser{WordDecoder: &mime.WordDecoder{CharsetReader: charset.NewReaderLabel}}
 
-// Email parses the message into email.Email and adds what only the envelope
-// knows: IP, BCC (recipients that are not in To or Cc headers) and the original EML.
-func (a *Envelope) Email() (*email.Email, error) {
-	m, err := email.ParseRawEmail(a.Data)
+// Envelope is a received message together with its SMTP envelope.
+// Recipients from RCPT TO are the only source of BCC addresses:
+// they never appear in the message headers.
+type Envelope struct {
+	RemoteAddr net.Addr
+	RemoteHost string   // reverse DNS of the client, "unknown" if none
+	Helo       string   // name the client gave in HELO/EHLO
+	From       string   // MAIL FROM, empty for bounces
+	To         []string // accepted RCPT TO, lowercased
+	TLS        bool     // message was received over STARTTLS
+
+	// Received is the trace header of this hop (RFC 5321 section 4.4),
+	// ending with CRLF. It is not part of Data; prepend it if needed.
+	Received string
+
+	// Data is the original message exactly as sent by the client
+	// (only the SMTP dot-stuffing is removed).
+	Data []byte
+}
+
+// Header parses the message headers.
+func (a *Envelope) Header() (mail.Header, error) {
+	m, err := mail.ReadMessage(bytes.NewReader(a.Data))
 	if err != nil {
 		return nil, err
 	}
-	if m == nil {
-		return nil, errors.New("inbox: can't parse message")
-	}
+	return m.Header, nil
+}
 
-	m.EML = a.Data
-	if ip := remoteIP(a.RemoteAddr); ip != nil {
-		m.IP = ip.String()
+// Addresses parses an address header like To or Cc, display names in any
+// charset are decoded. Missing or broken headers give nil.
+func (a *Envelope) Addresses(key string) []*mail.Address {
+	h, err := a.Header()
+	if err != nil {
+		return nil
 	}
+	return parseList(h.Get(key))
+}
 
-	visible := map[string]bool{}
-	if h, err := a.header(); err == nil {
-		if d, err := h.Date(); err == nil {
-			m.Date = &d
-		}
-		m.CC = parseList(h.Get("Cc"))
-		for _, x := range append(parseList(h.Get("To")), m.CC...) {
-			visible[strings.ToLower(x.Address)] = true
-		}
-	}
-
-	for _, rcpt := range a.To {
-		if !visible[rcpt] {
-			m.BCC = append(m.BCC, &mail.Address{Address: rcpt})
-		}
-	}
-	return m, nil
+// IP of the client, nil if unknown.
+func (a *Envelope) IP() net.IP {
+	return remoteIP(a.RemoteAddr)
 }
 
 // ValidDKIM reports whether the message has a valid DKIM signature of the
@@ -175,19 +183,10 @@ func foreignName(from *mail.Address) bool {
 	return false
 }
 
-// header parses the message headers.
-func (a *Envelope) header() (mail.Header, error) {
-	m, err := mail.ReadMessage(bytes.NewReader(a.Data))
-	if err != nil {
-		return nil, err
-	}
-	return m.Header, nil
-}
-
 // headerFrom returns the address of the From header. Several From headers or
 // addresses are refused: DKIM may cover one while the reader sees another.
 func (a *Envelope) headerFrom() (*mail.Address, error) {
-	h, err := a.header()
+	h, err := a.Header()
 	if err != nil {
 		return nil, err
 	}

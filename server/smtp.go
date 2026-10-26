@@ -1,35 +1,16 @@
-package inbox
+package server
 
 import (
 	"errors"
 	"fmt"
-	"net"
+
+	"github.com/monopolly/inbox/envelope"
 )
-
-// Envelope is a received message together with its SMTP envelope.
-// Recipients from RCPT TO are the only source of BCC addresses:
-// they never appear in the message headers.
-type Envelope struct {
-	RemoteAddr net.Addr
-	RemoteHost string   // reverse DNS of the client, "unknown" if none
-	Helo       string   // name the client gave in HELO/EHLO
-	From       string   // MAIL FROM, empty for bounces
-	To         []string // accepted RCPT TO, lowercased
-	TLS        bool     // message was received over STARTTLS
-
-	// Received is the trace header of this hop (RFC 5321 section 4.4),
-	// ending with CRLF. It is not part of Data; prepend it if needed.
-	Received string
-
-	// Data is the original message exactly as sent by the client
-	// (only the SMTP dot-stuffing is removed).
-	Data []byte
-}
 
 // Handler is called synchronously after DATA, before the client gets the reply.
 // nil means the message is accepted (250), ErrRejected rejects it permanently (554),
 // any other error makes the sender retry later (451).
-type Handler func(e *Envelope) error
+type Handler func(e *envelope.Envelope) error
 
 var (
 	// ErrRejected is returned (or wrapped) by Handler to reject a message permanently.

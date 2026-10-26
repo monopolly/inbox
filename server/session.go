@@ -1,4 +1,4 @@
-package inbox
+package server
 
 import (
 	"bufio"
@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/monopolly/inbox/envelope"
 )
 
 const (
@@ -299,7 +301,7 @@ func (s *session) cmdData(args string) bool {
 		return false
 	}
 
-	e := &Envelope{
+	e := &envelope.Envelope{
 		RemoteAddr: s.raw.RemoteAddr(),
 		RemoteHost: s.remoteHost,
 		Helo:       s.helo,
@@ -367,7 +369,7 @@ func (s *session) cmdStartTLS(args string) bool {
 }
 
 // deliver passes the message to Handler, a panic there becomes an error.
-func (s *session) deliver(e *Envelope) (err error) {
+func (s *session) deliver(e *envelope.Envelope) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("handler panic", "panic", r, "stack", string(debug.Stack()))

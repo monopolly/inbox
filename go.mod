@@ -1,4 +1,4 @@
-module inbox
+module github.com/monopolly/inbox
 
 go 1.26.3
 

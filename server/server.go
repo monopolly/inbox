@@ -1,4 +1,4 @@
-package inbox
+package server
 
 import (
 	"context"
