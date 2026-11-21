@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/monopolly/inbox/certs"
 	"github.com/monopolly/inbox/envelope"
 )
 
@@ -379,6 +380,57 @@ func TestStartTLS(t *testing.T) {
 	e := ts.next(t)
 	if !e.TLS || !strings.Contains(e.Received, "with ESMTPS") {
 		t.Errorf("envelope = %+v", e)
+	}
+}
+
+// startTLS runs STARTTLS with a TLS 1.2 client offering only suite.
+func startTLS(t *testing.T, ts *testServer, suite uint16) error {
+	t.Helper()
+	c := ts.dial(t, 220)
+	c.cmd("EHLO client", 250)
+	c.cmd("STARTTLS", 220)
+	conn := tls.Client(c.conn, &tls.Config{
+		InsecureSkipVerify: true,
+		MaxVersion:         tls.VersionTLS12,
+		CipherSuites:       []uint16{suite},
+	})
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	return conn.Handshake()
+}
+
+func TestCipherSuites(t *testing.T) {
+	ts := start(t, Options{})
+	for _, suite := range []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	} {
+		if err := startTLS(t, ts, suite); err == nil {
+			t.Errorf("%s accepted", tls.CipherSuiteName(suite))
+		}
+	}
+	for _, suite := range []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	} {
+		if err := startTLS(t, ts, suite); err != nil {
+			t.Errorf("%s: %v", tls.CipherSuiteName(suite), err)
+		}
+	}
+
+	// an explicit list in Options.TLS is not replaced
+	cert, err := certs.SelfSigned("Test", "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts = start(t, Options{TLS: &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA},
+	}})
+	if err := startTLS(t, ts, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA); err != nil {
+		t.Errorf("own suites: %v", err)
 	}
 }
 
